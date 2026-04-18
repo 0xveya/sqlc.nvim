@@ -25,6 +25,7 @@ end
 local function get_queries_from_file(filepath)
 	local queries = {}
 	local abs_path = vim.fn.fnamemodify(filepath, ":p")
+
 	if vim.fn.filereadable(abs_path) == 0 then
 		return queries
 	end
@@ -42,6 +43,7 @@ local function get_queries_from_file(filepath)
 		end
 		line_num = line_num + 1
 	end
+
 	return queries
 end
 
@@ -53,7 +55,6 @@ local function open_picker(pkg_name, all_queries)
 			items = all_queries,
 			title = "SQLC: " .. pkg_name,
 			format = "text",
-			-- Map internal fields to Snacks format
 			transform = function(item)
 				item.text = item.name
 				item.file = item.path
@@ -69,7 +70,7 @@ local function open_picker(pkg_name, all_queries)
 		return
 	end
 
-	local has_telescope, _ = pcall(require, "telescope")
+	local has_telescope = pcall(require, "telescope")
 	if has_telescope then
 		local pickers = require("telescope.pickers")
 		local finders = require("telescope.finders")
@@ -122,36 +123,41 @@ local function open_picker(pkg_name, all_queries)
 end
 
 function M.pick_query(use_last)
-	local config = M.parse_sqlc_config()
-	if not config or not config.sql then
+	local cfg = M.parse_sqlc_config()
+	if not cfg or not cfg.sql then
 		return
 	end
 
 	local function run(pkg_name, query_files)
 		M.last_used_pkg = pkg_name
 		local all_queries = {}
+
 		for _, file in ipairs(query_files) do
 			local file_queries = get_queries_from_file(file)
 			for _, q in ipairs(file_queries) do
 				table.insert(all_queries, q)
 			end
 		end
+
 		open_picker(pkg_name, all_queries)
 	end
 
-	-- Logic for 'Use Last'
 	if use_last and M.last_used_pkg then
-		for _, entry in ipairs(config.sql) do
-			if entry.gen.go.package == M.last_used_pkg then
-				return run(entry.gen.go.package, entry.queries)
+		for _, entry in ipairs(cfg.sql) do
+			if entry.gen and entry.gen.go and entry.gen.go.package == M.last_used_pkg then
+				return run(entry.gen.go.package, entry.queries or {})
 			end
 		end
 	end
 
-	-- Ask for DB
 	local db_options = {}
-	for _, entry in ipairs(config.sql) do
-		table.insert(db_options, { pkg = entry.gen.go.package, queries = entry.queries })
+	for _, entry in ipairs(cfg.sql) do
+		if entry.gen and entry.gen.go and entry.gen.go.package then
+			table.insert(db_options, {
+				pkg = entry.gen.go.package,
+				queries = entry.queries or {},
+			})
+		end
 	end
 
 	vim.ui.select(db_options, {
@@ -169,16 +175,74 @@ end
 function M.setup(opts)
 	local cfg = config.setup(opts)
 
+	vim.api.nvim_create_user_command("SqlcVet", function()
+		require("sqlc_nvim.lint").run_vet()
+	end, { desc = "Run sqlc vet and update diagnostics" })
+
+	vim.api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter" }, {
+		pattern = "*.sql",
+		group = vim.api.nvim_create_augroup("SqlcDiagnosticsApply", { clear = true }),
+		callback = function(args)
+			vim.schedule(function()
+				require("sqlc_nvim.lint").apply_to_buffer(args.buf)
+			end)
+		end,
+	})
+
 	if cfg.pick_db_keymap then
 		vim.keymap.set("n", cfg.pick_db_keymap, function()
 			M.pick_query(false)
-		end, { desc = "SQLC: Select DB and Query" })
+		end, { desc = "SQLC: Select DB" })
 	end
 
 	if cfg.use_last_keymap then
 		vim.keymap.set("n", cfg.use_last_keymap, function()
 			M.pick_query(true)
-		end, { desc = "SQLC: Last DB Queries" })
+		end, { desc = "SQLC: Last DB" })
+	end
+
+	if cfg.lint_keymap then
+		vim.keymap.set("n", cfg.lint_keymap, ":SqlcVet<CR>", {
+			silent = true,
+			desc = "SQLC: Vet project",
+		})
+	end
+
+	if cfg.lint_on_save then
+		vim.api.nvim_create_autocmd("BufWritePost", {
+			pattern = "*.sql",
+			group = vim.api.nvim_create_augroup("SqlcVet", { clear = true }),
+			callback = function(args)
+				local sqlc_data = M.parse_sqlc_config()
+				if not sqlc_data or not sqlc_data.sql then
+					return
+				end
+
+				local current_file = vim.api.nvim_buf_get_name(args.buf)
+				local is_managed = false
+
+				for _, entry in ipairs(sqlc_data.sql) do
+					for _, q_path in ipairs(entry.queries or {}) do
+						local pattern = q_path:gsub("^%.", ""):gsub("[%-%.%+%*%?%^%$%(%)%%]", "%%%1")
+
+						if current_file:find(pattern) then
+							is_managed = true
+							break
+						end
+					end
+
+					if is_managed then
+						break
+					end
+				end
+
+				if is_managed then
+					vim.schedule(function()
+						require("sqlc_nvim.lint").run_vet()
+					end)
+				end
+			end,
+		})
 	end
 end
 

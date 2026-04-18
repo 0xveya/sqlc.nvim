@@ -5,6 +5,9 @@ M.defaults = {
 	use_last_keymap = "<leader>sql",
 	yq_cmd = "yq -o=json . %s",
 	config_file = "sqlc.yaml",
+	lint_keymap = "<leader>sqv",
+	lint_on_save = true,
+	sqlc_cmd = "sqlc",
 }
 
 M.values = {}
