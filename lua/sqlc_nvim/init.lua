@@ -1,249 +1,263 @@
 local config = require("sqlc_nvim.config")
-local M = {}
+local project_mod = require("sqlc_nvim.project")
+local M = { last_package = nil, last_command = nil, group_by = "none" }
 
-M.last_used_pkg = nil
-
-function M.parse_sqlc_config()
-	local cfg = config.values
-	local config_path = vim.fn.getcwd() .. "/" .. cfg.config_file
-
-	if vim.fn.filereadable(config_path) == 0 then
-		return nil
+local function notify(message, level)
+	if config.values.notify then
+		vim.notify(message, level or vim.log.levels.INFO, { title = "sqlc.nvim" })
 	end
-
-	local cmd = string.format(cfg.yq_cmd, vim.fn.shellescape(config_path))
-	local json_data = vim.fn.system(cmd)
-
-	if vim.v.shell_error ~= 0 then
-		return nil
-	end
-
-	local ok, decoded = pcall(vim.json.decode, json_data)
-	return ok and decoded or nil
 end
 
-local function get_queries_from_file(filepath)
-	local queries = {}
-	local abs_path = vim.fn.fnamemodify(filepath, ":p")
-
-	if vim.fn.filereadable(abs_path) == 0 then
-		return queries
+local function map(lhs, rhs, desc)
+	if lhs and lhs ~= "" then
+		vim.keymap.set("n", lhs, rhs, { silent = true, desc = desc })
 	end
+end
 
-	local line_num = 1
-	for line in io.lines(abs_path) do
-		local name_with_type = line:match("%-%-%s*name:%s*(%w+.*)")
-		if name_with_type then
-			name_with_type = name_with_type:gsub("%s+$", "")
-			table.insert(queries, {
-				name = name_with_type,
-				path = abs_path,
-				lnum = line_num,
-			})
+local function query_items(project, filters)
+	filters = filters or {}
+	project_mod.query_files(project)
+	local items = {}
+	for _, entry in ipairs(project.sql) do
+		if not filters.package or entry.package == filters.package then
+			for _, path in ipairs(entry.files or {}) do
+				for lnum, line in ipairs(vim.fn.readfile(path)) do
+					local name, command = line:match("^%s*%-%-%s*name:%s*([%w_]+)%s*:?([%w]*)")
+					command = command ~= "" and command or "exec"
+					if name and (not filters.command or command:lower() == filters.command:lower()) then
+						local prefix = project.root:gsub("([^%w])", "%%%1") .. "/"
+						local relative = path:gsub("^" .. prefix, "")
+						table.insert(items, {
+							query = name,
+							command = command,
+							package = entry.package,
+							database = entry.package,
+							engine = entry.engine or "sql",
+							file = path,
+							relative_file = relative,
+							relative = relative .. ":" .. lnum,
+							lnum = lnum,
+							pos = { lnum, 0 },
+							preview = "file",
+							text = table.concat({
+								name,
+								command,
+								entry.package,
+								relative,
+								"query:" .. name,
+								command .. ":",
+								"type:" .. command,
+								"db:" .. entry.package,
+								"package:" .. entry.package,
+								"engine:" .. (entry.engine or "sql"),
+								"file:" .. relative,
+							}, " "),
+						})
+					end
+				end
+			end
 		end
-		line_num = line_num + 1
 	end
-
-	return queries
+	local group_fields = { database = "database", type = "command", file = "relative_file" }
+	local group_field = group_fields[M.group_by]
+	table.sort(items, function(a, b)
+		if group_field and a[group_field] ~= b[group_field] then
+			return a[group_field]:lower() < b[group_field]:lower()
+		end
+		return a.query:lower() < b.query:lower()
+	end)
+	for index, item in ipairs(items) do
+		local value = group_field and item[group_field] or nil
+		local previous = index > 1 and group_field and items[index - 1][group_field] or nil
+		item.group_label = value and value ~= previous and ("[" .. value .. "]") or nil
+		item.sort = ("%s %s"):format(value or "", item.query:lower())
+	end
+	return items
 end
 
-local function open_picker(pkg_name, all_queries)
-	local has_snacks, snacks = pcall(require, "snacks")
-	if has_snacks and snacks.picker then
-		snacks.picker.pick({
-			source = "sqlc_queries",
-			items = all_queries,
-			title = "SQLC: " .. pkg_name,
-			format = "text",
-			transform = function(item)
-				item.text = item.name
-				item.file = item.path
-				item.pos = { item.lnum, 0 }
-				return item
-			end,
-			confirm = function(picker, item)
-				picker:close()
-				vim.cmd("edit " .. item.path)
-				vim.api.nvim_win_set_cursor(0, { item.lnum, 0 })
-			end,
+local function scope_items(items, field)
+	local counts = {}
+	for _, item in ipairs(items) do
+		counts[item[field]] = (counts[item[field]] or 0) + 1
+	end
+	local result = {}
+	for label, count in pairs(counts) do
+		table.insert(result, {
+			kind = "scope",
+			label = label,
+			count = count,
+			text = label .. " " .. count .. " queries",
 		})
-		return
 	end
-
-	local has_telescope = pcall(require, "telescope")
-	if has_telescope then
-		local pickers = require("telescope.pickers")
-		local finders = require("telescope.finders")
-		local conf = require("telescope.config").values
-		local actions = require("telescope.actions")
-		local action_state = require("telescope.actions.state")
-
-		pickers
-			.new({}, {
-				prompt_title = "SQLC Queries: " .. pkg_name,
-				finder = finders.new_table({
-					results = all_queries,
-					entry_maker = function(entry)
-						return {
-							value = entry,
-							display = entry.name,
-							ordinal = entry.name,
-							path = entry.path,
-							lnum = entry.lnum,
-						}
-					end,
-				}),
-				sorter = conf.generic_sorter({}),
-				previewer = conf.file_previewer({}),
-				attach_mappings = function(prompt_bufnr)
-					actions.select_default:replace(function()
-						actions.close(prompt_bufnr)
-						local selection = action_state.get_selected_entry()
-						vim.cmd("edit " .. selection.path)
-						vim.api.nvim_win_set_cursor(0, { selection.lnum, 0 })
-					end)
-					return true
-				end,
-			})
-			:find()
-		return
-	end
-
-	vim.ui.select(all_queries, {
-		prompt = "SQLC Queries (" .. pkg_name .. "):",
-		format_item = function(item)
-			return item.name
-		end,
-	}, function(choice)
-		if choice then
-			vim.cmd("edit " .. choice.path)
-			vim.api.nvim_win_set_cursor(0, { choice.lnum, 0 })
-		end
+	table.sort(result, function(a, b)
+		return a.label:lower() < b.label:lower()
 	end)
+	return result
 end
 
-function M.pick_query(use_last)
-	local cfg = M.parse_sqlc_config()
-	if not cfg or not cfg.sql then
+local function load_project()
+	local project, err = project_mod.load()
+	if not project then
+		notify(err, vim.log.levels.WARN)
+		return nil
+	end
+	return project
+end
+
+function M.pick_query(opts)
+	if type(opts) == "boolean" then
+		opts = { package = opts and M.last_package or nil }
+	end
+	opts = opts or {}
+	local project = load_project()
+	if not project then
 		return
 	end
-
-	local function run(pkg_name, query_files)
-		M.last_used_pkg = pkg_name
-		local all_queries = {}
-
-		for _, file in ipairs(query_files) do
-			local file_queries = get_queries_from_file(file)
-			for _, q in ipairs(file_queries) do
-				table.insert(all_queries, q)
-			end
-		end
-
-		open_picker(pkg_name, all_queries)
+	local items = query_items(project, opts)
+	if #items == 0 and opts.package == M.last_package then
+		opts.package, items = nil, query_items(project, opts)
 	end
-
-	if use_last and M.last_used_pkg then
-		for _, entry in ipairs(cfg.sql) do
-			if entry.gen and entry.gen.go and entry.gen.go.package == M.last_used_pkg then
-				return run(entry.gen.go.package, entry.queries or {})
-			end
-		end
+	if #items == 0 then
+		notify("No named sqlc queries match this scope", vim.log.levels.WARN)
+		return
 	end
-
-	local db_options = {}
-	for _, entry in ipairs(cfg.sql) do
-		if entry.gen and entry.gen.go and entry.gen.go.package then
-			table.insert(db_options, {
-				pkg = entry.gen.go.package,
-				queries = entry.queries or {},
-			})
-		end
-	end
-
-	vim.ui.select(db_options, {
-		prompt = "Select Database:",
-		format_item = function(item)
-			return item.pkg
+	require("sqlc_nvim.picker").pick(items, {
+		title = ("sqlc queries%s%s"):format(
+			opts.package and (" · package:" .. opts.package) or "",
+			opts.command and (" · command:" .. opts.command) or ""
+		),
+		on_choice = function(item)
+			M.last_package = item.package
+			M.last_command = item.command
 		end,
-	}, function(choice)
-		if choice then
-			run(choice.pkg, choice.queries)
+	})
+end
+
+function M.pick_scope(field)
+	local project = load_project()
+	if not project then
+		return
+	end
+	local items = query_items(project)
+	local scopes = scope_items(items, field)
+	if #scopes == 0 then
+		notify("No named sqlc queries found", vim.log.levels.WARN)
+		return
+	end
+	require("sqlc_nvim.picker").pick(scopes, {
+		title = field == "package" and "sqlc packages" or "sqlc query commands",
+		select_only = true,
+		on_choice = function(item)
+			M.pick_query({ [field] = item.label })
+		end,
+	})
+end
+
+function M.set_group(group)
+	if not ({ none = true, database = true, type = true, file = true })[group] then
+		notify("Unknown grouping: " .. tostring(group), vim.log.levels.WARN)
+		return
+	end
+	M.group_by = group
+	notify("sqlc query grouping: " .. group)
+end
+
+local function complete_scope(field)
+	return function()
+		local project = project_mod.load()
+		if not project then
+			return {}
 		end
-	end)
+		return vim.tbl_map(function(item)
+			return item.label
+		end, scope_items(query_items(project), field))
+	end
 end
 
 function M.setup(opts)
 	local cfg = config.setup(opts)
+	M.group_by = cfg.picker.group_by
+	local group = vim.api.nvim_create_augroup("sqlc.nvim", { clear = true })
+	require("sqlc_nvim.highlight").setup(group)
 
+	vim.api.nvim_create_user_command("SqlcQueries", function(command)
+		M.pick_query({ package = command.args ~= "" and command.args or nil })
+	end, {
+		force = true,
+		nargs = "?",
+		complete = complete_scope("package"),
+		desc = "Pick a named sqlc query, optionally by package",
+	})
+	vim.api.nvim_create_user_command("SqlcPackages", function()
+		M.pick_scope("package")
+	end, { force = true, desc = "Pick a sqlc package, then a query" })
+	vim.api.nvim_create_user_command("SqlcQueryCommands", function()
+		M.pick_scope("command")
+	end, { force = true, desc = "Pick a sqlc command type, then a query" })
+	vim.api.nvim_create_user_command("SqlcGroup", function(command)
+		if command.args ~= "" then
+			M.set_group(command.args)
+			return
+		end
+		vim.ui.select({ "none", "database", "type", "file" }, { prompt = "sqlc query grouping" }, function(choice)
+			if choice then
+				M.set_group(choice)
+			end
+		end)
+	end, {
+		force = true,
+		nargs = "?",
+		complete = function()
+			return { "none", "database", "type", "file" }
+		end,
+		desc = "Choose display-only query grouping",
+	})
 	vim.api.nvim_create_user_command("SqlcVet", function()
-		require("sqlc_nvim.lint").run_vet()
-	end, { desc = "Run sqlc vet and update diagnostics" })
+		require("sqlc_nvim.lint").run({ manual = true })
+	end, { force = true, desc = "Run sqlc vet and refresh diagnostics" })
+	vim.api.nvim_create_user_command("SqlcDiagnosticsClear", function()
+		require("sqlc_nvim.lint").clear()
+	end, { force = true, desc = "Clear sqlc diagnostics" })
 
 	vim.api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter" }, {
+		group = group,
 		pattern = "*.sql",
-		group = vim.api.nvim_create_augroup("SqlcDiagnosticsApply", { clear = true }),
 		callback = function(args)
-			vim.schedule(function()
-				require("sqlc_nvim.lint").apply_to_buffer(args.buf)
-			end)
+			require("sqlc_nvim.lint").apply_to_buffer(args.buf)
 		end,
 	})
-
-	if cfg.pick_db_keymap then
-		vim.keymap.set("n", cfg.pick_db_keymap, function()
-			M.pick_query(false)
-		end, { desc = "SQLC: Select DB" })
-	end
-
-	if cfg.use_last_keymap then
-		vim.keymap.set("n", cfg.use_last_keymap, function()
-			M.pick_query(true)
-		end, { desc = "SQLC: Last DB" })
-	end
-
-	if cfg.lint_keymap then
-		vim.keymap.set("n", cfg.lint_keymap, ":SqlcVet<CR>", {
-			silent = true,
-			desc = "SQLC: Vet project",
-		})
-	end
-
 	if cfg.lint_on_save then
 		vim.api.nvim_create_autocmd("BufWritePost", {
+			group = group,
 			pattern = "*.sql",
-			group = vim.api.nvim_create_augroup("SqlcVet", { clear = true }),
 			callback = function(args)
-				local sqlc_data = M.parse_sqlc_config()
-				if not sqlc_data or not sqlc_data.sql then
-					return
-				end
-
-				local current_file = vim.api.nvim_buf_get_name(args.buf)
-				local is_managed = false
-
-				for _, entry in ipairs(sqlc_data.sql) do
-					for _, q_path in ipairs(entry.queries or {}) do
-						local pattern = q_path:gsub("^%.", ""):gsub("[%-%.%+%*%?%^%$%(%)%%]", "%%%1")
-
-						if current_file:find(pattern) then
-							is_managed = true
-							break
-						end
-					end
-
-					if is_managed then
-						break
-					end
-				end
-
-				if is_managed then
-					vim.schedule(function()
-						require("sqlc_nvim.lint").run_vet()
-					end)
+				local path = vim.api.nvim_buf_get_name(args.buf)
+				local project = project_mod.load(path)
+				if project and project_mod.is_managed(project, path) then
+					require("sqlc_nvim.lint").schedule(path)
 				end
 			end,
 		})
 	end
+
+	map(cfg.keymaps.pick, function()
+		M.pick_query(false)
+	end, "sqlc: query picker")
+	map(cfg.keymaps.pick_last, function()
+		M.pick_query(true)
+	end, "sqlc: last package queries")
+	map(cfg.keymaps.pick_package, function()
+		M.pick_scope("package")
+	end, "sqlc: package scope")
+	map(cfg.keymaps.pick_command, function()
+		M.pick_scope("command")
+	end, "sqlc: query command scope")
+	map(cfg.keymaps.group, function()
+		vim.cmd.SqlcGroup()
+	end, "sqlc: query grouping")
+	map(cfg.keymaps.vet, function()
+		require("sqlc_nvim.lint").run({ manual = true })
+	end, "sqlc: vet project")
 end
 
 return M

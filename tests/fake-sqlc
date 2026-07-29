@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "${SQLC_NVIM_FAKE_PASS:-0}" = "1" ]; then
+	exit 0
+fi
+echo "queries/widgets.sql:2:8: no such column: missing" >&2
+exit 1

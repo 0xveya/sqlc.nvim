@@ -1,0 +1,10 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries:
+      - "./queries"
+    schema: "./schema.sql"
+    gen:
+      go:
+        package: "fixturedb"
+        out: "./generated"
